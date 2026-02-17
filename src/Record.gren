@@ -1,0 +1,305 @@
+module Record exposing
+    ( Record
+    , RecordId
+    , recordIdFromInt
+    , recordIdToInt
+    , getAllRecords
+    , getRecord
+    , createRecord
+    , updateRecord
+    , deleteRecord
+    , markAsPlayed
+    , selectNextRecord
+    )
+
+import Array exposing (Array)
+import Db
+import Db.Decode as Decode
+import Db.Encode as Encode
+import Math
+import Task exposing (Task)
+import Time
+
+
+type RecordId
+    = RecordId Int
+
+
+recordIdFromInt : Int -> RecordId
+recordIdFromInt id =
+    RecordId id
+
+
+recordIdToInt : RecordId -> Int
+recordIdToInt (RecordId id) =
+    id
+
+
+type alias Record =
+    { id : RecordId
+    , artist : String
+    , title : String
+    , year : Maybe Int
+    , notes : Maybe String
+    , lastPlayedAt : Maybe Int
+    , playCount : Int
+    , createdAt : Int
+    }
+
+
+
+-- READ
+
+
+getAllRecords : Db.Connection -> Task Db.Error (Array Record)
+getAllRecords connection =
+    Db.getAll connection
+        { query = "SELECT id, artist, title, year, notes, last_played_at, play_count, created_at FROM records ORDER BY artist ASC, title ASC"
+        , parameters = []
+        , decoder = recordDecoder
+        }
+
+
+getRecord : Db.Connection -> RecordId -> Task Db.Error (Maybe Record)
+getRecord connection recordId =
+    Db.getMaybeOne connection
+        { query = "SELECT id, artist, title, year, notes, last_played_at, play_count, created_at FROM records WHERE id = :id"
+        , parameters = [ Encode.int "id" (recordIdToInt recordId) ]
+        , decoder = recordDecoder
+        }
+
+
+
+-- WRITE
+
+
+createRecord :
+    Db.Connection
+    ->
+        { artist : String
+        , title : String
+        , year : Maybe Int
+        , notes : Maybe String
+        , createdAt : Int
+        }
+    -> Task Db.Error {}
+createRecord connection newRecord =
+    Db.execute connection
+        { statement = "INSERT INTO records (artist, title, year, notes, play_count, created_at) VALUES (:artist, :title, :year, :notes, 0, :created_at)"
+        , parameters =
+            [ Encode.string "artist" newRecord.artist
+            , Encode.string "title" newRecord.title
+            , encodeMaybeInt "year" newRecord.year
+            , encodeMaybeString "notes" newRecord.notes
+            , Encode.int "created_at" newRecord.createdAt
+            ]
+        }
+        |> Task.map (\_ -> {})
+
+
+updateRecord :
+    Db.Connection
+    ->
+        { id : RecordId
+        , artist : String
+        , title : String
+        , year : Maybe Int
+        , notes : Maybe String
+        }
+    -> Task Db.Error {}
+updateRecord connection record =
+    Db.execute connection
+        { statement = "UPDATE records SET artist = :artist, title = :title, year = :year, notes = :notes WHERE id = :id"
+        , parameters =
+            [ Encode.int "id" (recordIdToInt record.id)
+            , Encode.string "artist" record.artist
+            , Encode.string "title" record.title
+            , encodeMaybeInt "year" record.year
+            , encodeMaybeString "notes" record.notes
+            ]
+        }
+        |> Task.map (\_ -> {})
+
+
+deleteRecord : Db.Connection -> RecordId -> Task Db.Error {}
+deleteRecord connection recordId =
+    Db.execute connection
+        { statement = "DELETE FROM records WHERE id = :id"
+        , parameters = [ Encode.int "id" (recordIdToInt recordId) ]
+        }
+        |> Task.map (\_ -> {})
+
+
+markAsPlayed : Db.Connection -> RecordId -> Int -> Task Db.Error {}
+markAsPlayed connection recordId nowMs =
+    Db.execute connection
+        { statement = "UPDATE records SET last_played_at = :now, play_count = play_count + 1 WHERE id = :id"
+        , parameters =
+            [ Encode.int "id" (recordIdToInt recordId)
+            , Encode.int "now" nowMs
+            ]
+        }
+        |> Task.map (\_ -> {})
+
+
+
+-- WEIGHTED SELECTION ALGORITHM
+
+
+type alias RecordWithWeight =
+    { record : Record
+    , weight : Float
+    }
+
+
+{-| Calculate weight based on days since last played.
+    Weight = daysSincePlayed ^ 1.5 (exponential favors older plays)
+    Never-played records get 365 days worth of weight.
+-}
+calculateWeight : Int -> Record -> RecordWithWeight
+calculateWeight nowMs record =
+    let
+        msPerDay =
+            86400000
+
+        daysSincePlayed =
+            when record.lastPlayedAt is
+                Nothing ->
+                    365.0
+
+                Just lastPlayed ->
+                    let
+                        diff =
+                            nowMs - lastPlayed
+                    in
+                    if diff < 0 then
+                        0.0
+                    else
+                        toFloat diff / toFloat msPerDay
+
+        weight =
+            daysSincePlayed ^ 1.5
+    in
+    { record = record
+    , weight = weight
+    }
+
+
+{-| Select a random record using weighted random selection.
+    Uses the provided seed (typically current timestamp) for randomness.
+-}
+selectNextRecord : Int -> Array Record -> Maybe Record
+selectNextRecord seed records =
+    if Array.isEmpty records then
+        Nothing
+    else
+        let
+            recordsWithWeights =
+                Array.map (calculateWeight seed) records
+
+            totalWeight =
+                Array.foldl (\rw acc -> acc + rw.weight) 0.0 recordsWithWeights
+
+            -- Use seed to generate a random number between 0 and totalWeight
+            randomValue =
+                pseudoRandom seed * totalWeight
+        in
+        selectByWeight randomValue recordsWithWeights
+
+
+{-| Simple pseudo-random number generator that returns a float between 0 and 1.
+    Uses a linear congruential generator approach.
+-}
+pseudoRandom : Int -> Float
+pseudoRandom seed =
+    let
+        -- LCG constants (same as glibc)
+        a =
+            1103515245
+
+        c =
+            12345
+
+        m =
+            2147483648
+
+        -- 2^31
+
+        nextSeed =
+            Math.modBy m (a * seed + c)
+    in
+    toFloat nextSeed / toFloat m
+
+
+{-| Walk through weighted records and select one based on random value.
+-}
+selectByWeight : Float -> Array RecordWithWeight -> Maybe Record
+selectByWeight target recordsWithWeights =
+    selectByWeightHelper target 0.0 recordsWithWeights
+
+
+selectByWeightHelper : Float -> Float -> Array RecordWithWeight -> Maybe Record
+selectByWeightHelper target cumulative recordsWithWeights =
+    when Array.first recordsWithWeights is
+        Nothing ->
+            Nothing
+
+        Just rw ->
+            let
+                newCumulative =
+                    cumulative + rw.weight
+            in
+            if target <= newCumulative then
+                Just rw.record
+            else
+                selectByWeightHelper target newCumulative (Array.dropFirst 1 recordsWithWeights)
+
+
+
+-- HELPERS
+
+
+encodeMaybeInt : String -> Maybe Int -> Encode.Value
+encodeMaybeInt name maybeValue =
+    when maybeValue is
+        Nothing ->
+            Encode.null name
+
+        Just value ->
+            Encode.int name value
+
+
+encodeMaybeString : String -> Maybe String -> Encode.Value
+encodeMaybeString name maybeValue =
+    when maybeValue is
+        Nothing ->
+            Encode.null name
+
+        Just value ->
+            Encode.string name value
+
+
+
+-- DECODER
+
+
+recordDecoder : Decode.Decoder Record
+recordDecoder =
+    Decode.field Decode.int "id" <| \id ->
+    Decode.field Decode.string "artist" <| \artist ->
+    Decode.field Decode.string "title" <| \title ->
+    Decode.field (Decode.maybe Decode.int) "year" <| \year ->
+    Decode.field (Decode.maybe Decode.string) "notes" <| \notes ->
+    Decode.field (Decode.maybe Decode.int) "last_played_at" <| \lastPlayedAt ->
+    Decode.field Decode.int "play_count" <| \playCount ->
+    Decode.field Decode.int "created_at" <| \createdAt ->
+    Decode.succeed
+        { id = recordIdFromInt id
+        , artist = artist
+        , title = title
+        , year = year
+        , notes = notes
+        , lastPlayedAt = lastPlayedAt
+        , playCount = playCount
+        , createdAt = createdAt
+        }

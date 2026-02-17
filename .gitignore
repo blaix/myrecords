@@ -1,0 +1,17 @@
+# Gren build output
+app
+.gren/
+
+# Nix
+result
+result-*
+
+# Data
+data/
+
+# Editor
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

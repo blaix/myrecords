@@ -1,0 +1,1202 @@
+module Main exposing (main)
+
+import Array exposing (Array)
+import Bytes
+import Db
+import Dict exposing (Dict)
+import HttpClient
+import HttpServer exposing (Request, Server)
+import HttpServer.Response as Response exposing (Response)
+import Init
+import Node exposing (Environment)
+import Record exposing (Record, RecordId)
+import Stream.Log
+import Task
+import Time
+import Transmutable.Html as H exposing (Html)
+import Transmutable.Html.Attributes as A
+import Url
+
+
+main : Node.Program Model Msg
+main =
+    Node.defineProgram
+        { init = init
+        , update = update
+        , subscriptions = subscriptions
+        }
+
+
+
+-- MODEL
+
+
+type alias Model =
+    { server : Maybe Server
+    , port_ : Int
+    , ws4sqlPort : Int
+    , env : Node.Environment
+    , dbConnection : Db.Connection
+    }
+
+
+type alias Config =
+    { port_ : Int
+    , ws4sqlPort : Int
+    }
+
+
+defaultConfig : Config
+defaultConfig =
+    { port_ = 3000
+    , ws4sqlPort = 12321
+    }
+
+
+parseArgs : Array String -> Config
+parseArgs args =
+    Array.foldl parseArg { config = defaultConfig, pendingFlag = Nothing } args
+        |> .config
+
+
+parseArg :
+    String
+    -> { config : Config, pendingFlag : Maybe String }
+    -> { config : Config, pendingFlag : Maybe String }
+parseArg arg state =
+    when state.pendingFlag is
+        Just "--port" ->
+            { config =
+                { state.config
+                    | port_ = String.toInt arg |> Maybe.withDefault state.config.port_
+                }
+            , pendingFlag = Nothing
+            }
+
+        Just "--ws4sql-port" ->
+            { config =
+                { state.config
+                    | ws4sqlPort = String.toInt arg |> Maybe.withDefault state.config.ws4sqlPort
+                }
+            , pendingFlag = Nothing
+            }
+
+        Just _ ->
+            { state | pendingFlag = Nothing }
+
+        Nothing ->
+            if arg == "--port" || arg == "--ws4sql-port" then
+                { state | pendingFlag = Just arg }
+            else
+                state
+
+
+
+-- INIT
+
+
+init : Environment -> Init.Task { model : Model, command : Cmd Msg }
+init env =
+    Init.await HttpServer.initialize <| \serverPermission ->
+    Init.await HttpClient.initialize <| \httpClientPermission ->
+        let
+            config =
+                parseArgs env.args
+
+            dbConnection =
+                Db.init httpClientPermission
+                    ("http://localhost:" ++ String.fromInt config.ws4sqlPort ++ "/myrecords")
+
+            serverConfig =
+                { host = "0.0.0.0"
+                , port_ = config.port_
+                }
+        in
+        Node.startProgram
+            { model =
+                { server = Nothing
+                , port_ = config.port_
+                , ws4sqlPort = config.ws4sqlPort
+                , env = env
+                , dbConnection = dbConnection
+                }
+            , command =
+                Cmd.batch
+                    [ initializeSchema dbConnection
+                        |> Task.attempt SchemaInitialized
+                    , HttpServer.createServer serverPermission serverConfig
+                        |> Task.attempt GotServer
+                    ]
+            }
+
+
+
+-- SCHEMA
+
+
+initializeSchema : Db.Connection -> Task.Task Db.Error {}
+initializeSchema connection =
+    Db.execute connection
+        { statement = """
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                artist TEXT NOT NULL,
+                title TEXT NOT NULL,
+                year INTEGER,
+                notes TEXT,
+                last_played_at INTEGER,
+                play_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
+            """
+        , parameters = []
+        }
+        |> Task.map (\_ -> {})
+
+
+
+-- MSG
+
+
+type Msg
+    = GotServer (Result HttpServer.ServerError Server)
+    | GotRequest { request : Request, response : Response }
+    | SchemaInitialized (Result Db.Error {})
+    -- Records
+    | GotRecords { response : Response, result : Result Db.Error (Array Record) }
+    | GotRecord { response : Response, recordId : String, result : Result Db.Error (Maybe Record) }
+    | RecordCreated { response : Response, result : Result Db.Error {} }
+    | RecordUpdated { response : Response, result : Result Db.Error {} }
+    | RecordDeleted { response : Response, result : Result Db.Error {} }
+    | RecordMarkedPlayed { response : Response, result : Result Db.Error {} }
+    -- Home page
+    | GotRecordsForHome { response : Response, nowMs : Int, result : Result Db.Error (Array Record) }
+    | GotRecordsForPick { response : Response, nowMs : Int, result : Result Db.Error (Array Record) }
+    -- Time
+    | GotTimeForCreate { response : Response, formData : Dict String String, time : Time.Posix }
+    | GotTimeForHome { response : Response, time : Time.Posix }
+    | GotTimeForPick { response : Response, time : Time.Posix }
+    | GotTimeForPlayed { response : Response, recordId : RecordId, time : Time.Posix }
+
+
+
+-- UPDATE
+
+
+update : Msg -> Model -> { model : Model, command : Cmd Msg }
+update msg model =
+    when msg is
+        GotServer result ->
+            when result is
+                Ok server ->
+                    { model = { model | server = Just server }
+                    , command =
+                        model.port_
+                            |> String.fromInt
+                            |> String.prepend "Server started on port "
+                            |> Stream.Log.line model.env.stdout
+                            |> Task.execute
+                    }
+
+                Err (HttpServer.ServerError error) ->
+                    { model = model
+                    , command =
+                        "Failed to start server: "
+                            ++ error.message
+                            |> Stream.Log.line model.env.stderr
+                            |> Task.map (\_ -> Node.exitWithCode 1)
+                            |> Task.executeCmd
+                    }
+
+        SchemaInitialized result ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command =
+                        Stream.Log.line model.env.stdout "Database schema initialized"
+                            |> Task.execute
+                    }
+
+                Err error ->
+                    { model = model
+                    , command =
+                        "Failed to initialize schema: "
+                            ++ Db.errorToString error
+                            |> Stream.Log.line model.env.stderr
+                            |> Task.execute
+                    }
+
+        GotRequest { request, response } ->
+            handleRequest model request response
+
+        -- Records
+        GotRecords { response, result } ->
+            when result is
+                Ok records ->
+                    { model = model
+                    , command = sendHtml response (recordsListPage records)
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Database error: " ++ Db.errorToString error)
+                    }
+
+        GotRecord { response, recordId, result } ->
+            when result is
+                Ok maybeRecord ->
+                    when maybeRecord is
+                        Just record ->
+                            { model = model
+                            , command = sendHtml response (editRecordPage record)
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 404 ("Record not found: " ++ recordId)
+                            }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Database error: " ++ Db.errorToString error)
+                    }
+
+        RecordCreated { response, result } ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command = redirect response "/records"
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Failed to create record: " ++ Db.errorToString error)
+                    }
+
+        RecordUpdated { response, result } ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command = redirect response "/records"
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Failed to update record: " ++ Db.errorToString error)
+                    }
+
+        RecordDeleted { response, result } ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command = redirect response "/records"
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Failed to delete record: " ++ Db.errorToString error)
+                    }
+
+        RecordMarkedPlayed { response, result } ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command = redirect response "/"
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Failed to mark record as played: " ++ Db.errorToString error)
+                    }
+
+        -- Home page
+        GotRecordsForHome { response, nowMs, result } ->
+            when result is
+                Ok records ->
+                    let
+                        suggestion =
+                            Record.selectNextRecord nowMs records
+                    in
+                    { model = model
+                    , command = sendHtml response (homePage suggestion)
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Database error: " ++ Db.errorToString error)
+                    }
+
+        GotRecordsForPick { response, nowMs, result } ->
+            when result is
+                Ok records ->
+                    let
+                        suggestion =
+                            Record.selectNextRecord nowMs records
+                    in
+                    { model = model
+                    , command = sendHtml response (homePage suggestion)
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Database error: " ++ Db.errorToString error)
+                    }
+
+        -- Time
+        GotTimeForCreate { response, formData, time } ->
+            handleCreateRecordWithTime model response formData (Time.posixToMillis time)
+
+        GotTimeForHome { response, time } ->
+            let
+                nowMs =
+                    Time.posixToMillis time
+            in
+            { model = model
+            , command =
+                Record.getAllRecords model.dbConnection
+                    |> Task.attempt (\result -> GotRecordsForHome { response = response, nowMs = nowMs, result = result })
+            }
+
+        GotTimeForPick { response, time } ->
+            let
+                nowMs =
+                    Time.posixToMillis time
+            in
+            { model = model
+            , command =
+                Record.getAllRecords model.dbConnection
+                    |> Task.attempt (\result -> GotRecordsForPick { response = response, nowMs = nowMs, result = result })
+            }
+
+        GotTimeForPlayed { response, recordId, time } ->
+            let
+                nowMs =
+                    Time.posixToMillis time
+            in
+            { model = model
+            , command =
+                Record.markAsPlayed model.dbConnection recordId nowMs
+                    |> Task.attempt (\result -> RecordMarkedPlayed { response = response, result = result })
+            }
+
+
+
+-- ROUTING
+
+
+handleRequest : Model -> Request -> Response -> { model : Model, command : Cmd Msg }
+handleRequest model request response =
+    when Array.dropFirst 1 (String.split "/" request.url.path) is
+        [ "" ] ->
+            { model = model
+            , command =
+                Time.now
+                    |> Task.perform (\time -> GotTimeForHome { response = response, time = time })
+            }
+
+        -- Static files
+        [ "styles.css" ] ->
+            { model = model
+            , command = serveStaticCss response
+            }
+
+        -- Pick another record
+        [ "pick" ] ->
+            when request.method is
+                HttpServer.POST ->
+                    { model = model
+                    , command =
+                        Time.now
+                            |> Task.perform (\time -> GotTimeForPick { response = response, time = time })
+                    }
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        -- Records
+        [ "records" ] ->
+            when request.method is
+                HttpServer.GET ->
+                    { model = model
+                    , command =
+                        Record.getAllRecords model.dbConnection
+                            |> Task.attempt (\result -> GotRecords { response = response, result = result })
+                    }
+
+                HttpServer.POST ->
+                    handleCreateRecord model request response
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "records", idStr, "edit" ] ->
+            when request.method is
+                HttpServer.GET ->
+                    when String.toInt idStr is
+                        Just id ->
+                            { model = model
+                            , command =
+                                Record.getRecord model.dbConnection (Record.recordIdFromInt id)
+                                    |> Task.attempt (\result -> GotRecord { response = response, recordId = idStr, result = result })
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 400 "Invalid record ID"
+                            }
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "records", idStr, "delete" ] ->
+            when request.method is
+                HttpServer.POST ->
+                    when String.toInt idStr is
+                        Just id ->
+                            { model = model
+                            , command =
+                                Record.deleteRecord model.dbConnection (Record.recordIdFromInt id)
+                                    |> Task.attempt (\result -> RecordDeleted { response = response, result = result })
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 400 "Invalid record ID"
+                            }
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "records", idStr, "played" ] ->
+            when request.method is
+                HttpServer.POST ->
+                    when String.toInt idStr is
+                        Just id ->
+                            { model = model
+                            , command =
+                                Time.now
+                                    |> Task.perform (\time -> GotTimeForPlayed { response = response, recordId = Record.recordIdFromInt id, time = time })
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 400 "Invalid record ID"
+                            }
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "records", idStr ] ->
+            when request.method is
+                HttpServer.POST ->
+                    handleUpdateRecord model idStr request response
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        _ ->
+            { model = model
+            , command = sendError response 404 "Not found"
+            }
+
+
+
+-- FORM HANDLERS
+
+
+handleCreateRecord : Model -> Request -> Response -> { model : Model, command : Cmd Msg }
+handleCreateRecord model request response =
+    let
+        formData =
+            parseFormData request.body
+    in
+    { model = model
+    , command =
+        Time.now
+            |> Task.perform (\time -> GotTimeForCreate { response = response, formData = formData, time = time })
+    }
+
+
+handleCreateRecordWithTime : Model -> Response -> Dict String String -> Int -> { model : Model, command : Cmd Msg }
+handleCreateRecordWithTime model response formData nowMs =
+    let
+        maybeArtist =
+            Dict.get "artist" formData
+
+        maybeTitle =
+            Dict.get "title" formData
+
+        year =
+            Dict.get "year" formData
+                |> Maybe.andThen String.toInt
+
+        notes =
+            Dict.get "notes" formData
+                |> Maybe.andThen
+                    (\n ->
+                        if String.isEmpty (String.trim n) then
+                            Nothing
+                        else
+                            Just n
+                    )
+    in
+    when { artist = maybeArtist, title = maybeTitle } is
+        { artist = Just artist, title = Just title } ->
+            { model = model
+            , command =
+                Record.createRecord model.dbConnection
+                    { artist = artist
+                    , title = title
+                    , year = year
+                    , notes = notes
+                    , createdAt = nowMs
+                    }
+                    |> Task.attempt (\result -> RecordCreated { response = response, result = result })
+            }
+
+        _ ->
+            { model = model
+            , command = sendError response 400 "Missing required fields: artist and title"
+            }
+
+
+handleUpdateRecord : Model -> String -> Request -> Response -> { model : Model, command : Cmd Msg }
+handleUpdateRecord model idStr request response =
+    let
+        formData =
+            parseFormData request.body
+
+        maybeId =
+            String.toInt idStr
+
+        maybeArtist =
+            Dict.get "artist" formData
+
+        maybeTitle =
+            Dict.get "title" formData
+
+        year =
+            Dict.get "year" formData
+                |> Maybe.andThen String.toInt
+
+        notes =
+            Dict.get "notes" formData
+                |> Maybe.andThen
+                    (\n ->
+                        if String.isEmpty (String.trim n) then
+                            Nothing
+                        else
+                            Just n
+                    )
+    in
+    when { id = maybeId, artist = maybeArtist, title = maybeTitle } is
+        { id = Just id, artist = Just artist, title = Just title } ->
+            { model = model
+            , command =
+                Record.updateRecord model.dbConnection
+                    { id = Record.recordIdFromInt id
+                    , artist = artist
+                    , title = title
+                    , year = year
+                    , notes = notes
+                    }
+                    |> Task.attempt (\result -> RecordUpdated { response = response, result = result })
+            }
+
+        _ ->
+            { model = model
+            , command = sendError response 400 "Missing required fields"
+            }
+
+
+
+-- FORM DATA PARSING
+
+
+parseFormData : Bytes.Bytes -> Dict String String
+parseFormData body =
+    body
+        |> Bytes.toString
+        |> Maybe.withDefault ""
+        |> String.split "&"
+        |> Array.foldl
+            (\pair acc ->
+                when String.split "=" pair is
+                    [ key, value ] ->
+                        Dict.set (decodeFormValue key) (decodeFormValue value) acc
+
+                    _ ->
+                        acc
+            )
+            Dict.empty
+
+
+{-| Decode a form value, handling both %XX encoding and + for spaces.
+-}
+decodeFormValue : String -> String
+decodeFormValue value =
+    value
+        |> String.replace "+" " "
+        |> Url.percentDecode
+        |> Maybe.withDefault value
+
+
+
+-- RESPONSE HELPERS
+
+
+sendHtml : Response -> String -> Cmd Msg
+sendHtml response html =
+    response
+        |> Response.setHeader "Content-Type" "text/html; charset=utf-8"
+        |> Response.setBody html
+        |> Response.send
+
+
+sendError : Response -> Int -> String -> Cmd Msg
+sendError response status message =
+    response
+        |> Response.setStatus status
+        |> Response.setHeader "Content-Type" "text/html; charset=utf-8"
+        |> Response.setBody (errorPage status message)
+        |> Response.send
+
+
+redirect : Response -> String -> Cmd Msg
+redirect response path =
+    response
+        |> Response.setStatus 303
+        |> Response.setHeader "Location" path
+        |> Response.send
+
+
+serveStaticCss : Response -> Cmd Msg
+serveStaticCss response =
+    response
+        |> Response.setHeader "Content-Type" "text/css"
+        |> Response.setBody customCss
+        |> Response.send
+
+
+customCss : String
+customCss =
+    """
+/* MyRecords Custom Styles */
+body {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 1rem;
+}
+
+nav ul {
+    display: flex;
+    gap: 1rem;
+    list-style: none;
+    padding: 0;
+    margin: 0 0 1rem 0;
+}
+
+nav a {
+    padding: 0.5rem 1rem;
+}
+
+.inline-form {
+    display: inline;
+}
+
+.inline-form button {
+    background: none;
+    border: none;
+    color: #dc3545;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
+}
+
+.inline-form button:hover {
+    color: #a71d2a;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+}
+
+th, td {
+    padding: 0.5rem;
+    text-align: left;
+    border-bottom: 1px solid #ddd;
+}
+
+th {
+    background-color: #f5f5f5;
+}
+
+.actions {
+    white-space: nowrap;
+}
+
+.actions a,
+.actions button {
+    margin-right: 0.5rem;
+}
+
+form > div {
+    margin-bottom: 1rem;
+}
+
+label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-weight: bold;
+}
+
+input[type="text"],
+input[type="number"],
+textarea,
+select {
+    width: 100%;
+    max-width: 400px;
+    padding: 0.5rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+}
+
+textarea {
+    min-height: 100px;
+    resize: vertical;
+}
+
+button[type="submit"] {
+    padding: 0.5rem 1rem;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+button[type="submit"]:hover {
+    background-color: #0056b3;
+}
+
+.error {
+    color: #dc3545;
+    background-color: #f8d7da;
+    border: 1px solid #f5c6cb;
+    padding: 1rem;
+    border-radius: 4px;
+    margin-bottom: 1rem;
+}
+
+/* Home page / suggestion styles */
+.suggestion {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 2rem;
+    border-radius: 8px;
+    margin: 2rem 0;
+    text-align: center;
+}
+
+.suggestion h2 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.5rem;
+}
+
+.suggestion .artist {
+    font-size: 2rem;
+    font-weight: bold;
+    margin: 0.5rem 0;
+}
+
+.suggestion .title {
+    font-size: 1.5rem;
+    font-style: italic;
+    margin: 0.5rem 0;
+}
+
+.suggestion .year {
+    font-size: 1rem;
+    opacity: 0.8;
+    margin: 0.5rem 0;
+}
+
+.suggestion .notes {
+    font-size: 0.9rem;
+    opacity: 0.9;
+    margin: 1rem 0;
+    font-style: italic;
+}
+
+.suggestion .play-info {
+    font-size: 0.85rem;
+    opacity: 0.7;
+    margin-top: 1rem;
+}
+
+.suggestion-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    margin-top: 1.5rem;
+}
+
+.suggestion-actions form {
+    display: inline;
+}
+
+.suggestion-actions button {
+    padding: 0.75rem 1.5rem;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 1rem;
+}
+
+.suggestion-actions .play-btn {
+    background-color: #28a745;
+    color: white;
+}
+
+.suggestion-actions .play-btn:hover {
+    background-color: #218838;
+}
+
+.suggestion-actions .pick-btn {
+    background-color: rgba(255, 255, 255, 0.2);
+    color: white;
+    border: 2px solid white;
+}
+
+.suggestion-actions .pick-btn:hover {
+    background-color: rgba(255, 255, 255, 0.3);
+}
+
+.no-records {
+    text-align: center;
+    padding: 2rem;
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    margin: 2rem 0;
+}
+
+.no-records a {
+    color: #007bff;
+}
+"""
+
+
+
+-- VIEWS
+
+
+layout : { title : String, body : Array (Html msg) } -> String
+layout config =
+    "<!DOCTYPE html>"
+        ++ H.toString
+            (H.html []
+                [ H.head []
+                    [ H.meta [ A.charset "utf-8" ]
+                    , H.meta
+                        [ A.name "viewport"
+                        , A.content "width=device-width, initial-scale=1"
+                        ]
+                    , H.title [ H.text config.title ]
+                    , H.link
+                        [ A.rel "stylesheet"
+                        , A.href "https://cdn.jsdelivr.net/npm/kelpui@1/css/kelp.css"
+                        ]
+                    , H.link
+                        [ A.rel "stylesheet"
+                        , A.href "/styles.css"
+                        ]
+                    ]
+                , H.body []
+                    [ navigation
+                    , H.main_ [] config.body
+                    ]
+                ]
+            )
+
+
+navigation : Html msg
+navigation =
+    H.nav []
+        [ H.ul []
+            [ H.li [] [ H.a [ A.href "/" ] [ H.text "Home" ] ]
+            , H.li [] [ H.a [ A.href "/records" ] [ H.text "Records" ] ]
+            ]
+        ]
+
+
+errorPage : Int -> String -> String
+errorPage status message =
+    layout
+        { title = "Error - MyRecords"
+        , body =
+            [ H.h1 [] [ H.text ("Error " ++ String.fromInt status) ]
+            , H.div [ A.class "error" ] [ H.text message ]
+            , H.p [] [ H.a [ A.href "/" ] [ H.text "Back to Home" ] ]
+            ]
+        }
+
+
+
+-- HOME PAGE
+
+
+homePage : Maybe Record -> String
+homePage maybeSuggestion =
+    layout
+        { title = "MyRecords"
+        , body =
+            [ H.h1 [] [ H.text "What to Play?" ]
+            , when maybeSuggestion is
+                Nothing ->
+                    H.div [ A.class "no-records" ]
+                        [ H.p [] [ H.text "No records in your collection yet!" ]
+                        , H.p []
+                            [ H.a [ A.href "/records" ] [ H.text "Add some records" ]
+                            , H.text " to get started."
+                            ]
+                        ]
+
+                Just record ->
+                    suggestionCard record
+            ]
+        }
+
+
+suggestionCard : Record -> Html msg
+suggestionCard record =
+    let
+        idStr =
+            String.fromInt (Record.recordIdToInt record.id)
+    in
+    H.div [ A.class "suggestion" ]
+        [ H.h2 [] [ H.text "You should play..." ]
+        , H.div [ A.class "artist" ] [ H.text record.artist ]
+        , H.div [ A.class "title" ] [ H.text record.title ]
+        , when record.year is
+            Nothing ->
+                H.text ""
+
+            Just year ->
+                H.div [ A.class "year" ] [ H.text ("(" ++ String.fromInt year ++ ")") ]
+        , when record.notes is
+            Nothing ->
+                H.text ""
+
+            Just notes ->
+                H.div [ A.class "notes" ] [ H.text notes ]
+        , H.div [ A.class "play-info" ]
+            [ H.text
+                (if record.playCount == 0 then
+                    "Never played"
+                 else
+                    "Played " ++ String.fromInt record.playCount ++ " time" ++ (if record.playCount == 1 then "" else "s")
+                )
+            ]
+        , H.div [ A.class "suggestion-actions" ]
+            [ H.form [ A.method "post", A.action ("/records/" ++ idStr ++ "/played") ]
+                [ H.button [ A.type_ "submit", A.class "play-btn" ] [ H.text "I played it!" ]
+                ]
+            , H.form [ A.method "post", A.action "/pick" ]
+                [ H.button [ A.type_ "submit", A.class "pick-btn" ] [ H.text "Pick another" ]
+                ]
+            ]
+        ]
+
+
+
+-- RECORDS LIST PAGE
+
+
+recordsListPage : Array Record -> String
+recordsListPage records =
+    layout
+        { title = "Records - MyRecords"
+        , body =
+            [ H.h1 [] [ H.text "My Record Collection" ]
+            , H.h2 [] [ H.text "Add New Record" ]
+            , recordForm Nothing
+            , H.h2 [] [ H.text "Current Records" ]
+            , if Array.isEmpty records then
+                H.p [] [ H.text "No records yet. Add one above!" ]
+              else
+                H.table []
+                    [ H.thead []
+                        [ H.tr []
+                            [ H.th [] [ H.text "Artist" ]
+                            , H.th [] [ H.text "Title" ]
+                            , H.th [] [ H.text "Year" ]
+                            , H.th [] [ H.text "Plays" ]
+                            , H.th [] [ H.text "Actions" ]
+                            ]
+                        ]
+                    , H.tbody [] (Array.map recordRow records)
+                    ]
+            ]
+        }
+
+
+recordRow : Record -> Html msg
+recordRow record =
+    let
+        idStr =
+            String.fromInt (Record.recordIdToInt record.id)
+
+        yearStr =
+            when record.year is
+                Nothing ->
+                    "-"
+
+                Just year ->
+                    String.fromInt year
+    in
+    H.tr []
+        [ H.td [] [ H.text record.artist ]
+        , H.td [] [ H.text record.title ]
+        , H.td [] [ H.text yearStr ]
+        , H.td [] [ H.text (String.fromInt record.playCount) ]
+        , H.td [ A.class "actions" ]
+            [ H.a [ A.href ("/records/" ++ idStr ++ "/edit") ] [ H.text "Edit" ]
+            , H.form
+                [ A.method "post"
+                , A.action ("/records/" ++ idStr ++ "/delete")
+                , A.class "inline-form"
+                ]
+                [ H.button [ A.type_ "submit" ] [ H.text "Delete" ]
+                ]
+            ]
+        ]
+
+
+recordForm : Maybe Record -> Html msg
+recordForm maybeRecord =
+    let
+        action =
+            when maybeRecord is
+                Nothing ->
+                    "/records"
+
+                Just record ->
+                    "/records/" ++ String.fromInt (Record.recordIdToInt record.id)
+
+        artistValue =
+            maybeRecord
+                |> Maybe.map .artist
+                |> Maybe.withDefault ""
+
+        titleValue =
+            maybeRecord
+                |> Maybe.map .title
+                |> Maybe.withDefault ""
+
+        yearValue =
+            maybeRecord
+                |> Maybe.andThen .year
+                |> Maybe.map String.fromInt
+                |> Maybe.withDefault ""
+
+        notesValue =
+            maybeRecord
+                |> Maybe.andThen .notes
+                |> Maybe.withDefault ""
+
+        buttonText =
+            when maybeRecord is
+                Nothing ->
+                    "Add Record"
+
+                Just _ ->
+                    "Update Record"
+    in
+    H.form [ A.method "post", A.action action ]
+        [ H.div []
+            [ H.label [ A.for "artist" ] [ H.text "Artist" ]
+            , H.input
+                [ A.type_ "text"
+                , A.name "artist"
+                , A.id "artist"
+                , A.value artistValue
+                , A.attribute "required" "required"
+                ]
+                []
+            ]
+        , H.div []
+            [ H.label [ A.for "title" ] [ H.text "Title" ]
+            , H.input
+                [ A.type_ "text"
+                , A.name "title"
+                , A.id "title"
+                , A.value titleValue
+                , A.attribute "required" "required"
+                ]
+                []
+            ]
+        , H.div []
+            [ H.label [ A.for "year" ] [ H.text "Year (optional)" ]
+            , H.input
+                [ A.type_ "number"
+                , A.name "year"
+                , A.id "year"
+                , A.value yearValue
+                , A.attribute "min" "1900"
+                , A.attribute "max" "2100"
+                ]
+                []
+            ]
+        , H.div []
+            [ H.label [ A.for "notes" ] [ H.text "Notes (optional)" ]
+            , H.textarea
+                [ A.name "notes"
+                , A.id "notes"
+                ]
+                [ H.text notesValue ]
+            ]
+        , H.div []
+            [ H.button [ A.type_ "submit" ] [ H.text buttonText ]
+            ]
+        ]
+
+
+editRecordPage : Record -> String
+editRecordPage record =
+    layout
+        { title = "Edit Record - MyRecords"
+        , body =
+            [ H.h1 [] [ H.text "Edit Record" ]
+            , H.p [] [ H.a [ A.href "/records" ] [ H.text "Back to Records" ] ]
+            , recordForm (Just record)
+            ]
+        }
+
+
+
+-- SUBSCRIPTIONS
+
+
+subscriptions : Model -> Sub Msg
+subscriptions model =
+    when model.server is
+        Just server ->
+            HttpServer.onRequest server
+                (\req res -> GotRequest { request = req, response = res })
+
+        Nothing ->
+            Sub.none
