@@ -16,7 +16,7 @@ import Array exposing (Array)
 import Db
 import Db.Decode as Decode
 import Db.Encode as Encode
-import Math
+import Random
 import Task exposing (Task)
 import Time
 
@@ -200,35 +200,13 @@ selectNextRecord seed records =
             totalWeight =
                 Array.foldl (\rw acc -> acc + rw.weight) 0.0 recordsWithWeights
 
-            -- Use seed to generate a random number between 0 and totalWeight
-            randomValue =
-                pseudoRandom seed * totalWeight
+            generator =
+                Random.float 0 totalWeight
+
+            { value } =
+                Random.step generator (Random.initialSeed seed)
         in
-        selectByWeight randomValue recordsWithWeights
-
-
-{-| Simple pseudo-random number generator that returns a float between 0 and 1.
-    Uses a linear congruential generator approach.
--}
-pseudoRandom : Int -> Float
-pseudoRandom seed =
-    let
-        -- LCG constants (same as glibc)
-        a =
-            1103515245
-
-        c =
-            12345
-
-        m =
-            2147483648
-
-        -- 2^31
-
-        nextSeed =
-            Math.modBy m (a * seed + c)
-    in
-    toFloat nextSeed / toFloat m
+        selectByWeight value recordsWithWeights
 
 
 {-| Walk through weighted records and select one based on random value.
