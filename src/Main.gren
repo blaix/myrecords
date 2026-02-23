@@ -143,6 +143,7 @@ initializeSchema connection =
                 artist TEXT NOT NULL,
                 title TEXT NOT NULL,
                 year INTEGER,
+                month INTEGER,
                 notes TEXT,
                 last_played_at INTEGER,
                 play_count INTEGER NOT NULL DEFAULT 0,
@@ -151,6 +152,14 @@ initializeSchema connection =
             """
         , parameters = []
         }
+        |> Task.andThen
+            (\_ ->
+                Db.execute connection
+                    { statement = "ALTER TABLE records ADD COLUMN month INTEGER"
+                    , parameters = []
+                    }
+                    |> Task.onError (\_ -> Task.succeed 0)
+            )
         |> Task.map (\_ -> {})
 
 
@@ -542,6 +551,10 @@ handleCreateRecordWithTime model response formData nowMs =
             Dict.get "year" formData
                 |> Maybe.andThen String.toInt
 
+        month =
+            Dict.get "month" formData
+                |> Maybe.andThen String.toInt
+
         notes =
             Dict.get "notes" formData
                 |> Maybe.andThen
@@ -560,6 +573,7 @@ handleCreateRecordWithTime model response formData nowMs =
                     { artist = artist
                     , title = title
                     , year = year
+                    , month = month
                     , notes = notes
                     , createdAt = nowMs
                     }
@@ -591,6 +605,10 @@ handleUpdateRecord model idStr request response =
             Dict.get "year" formData
                 |> Maybe.andThen String.toInt
 
+        month =
+            Dict.get "month" formData
+                |> Maybe.andThen String.toInt
+
         notes =
             Dict.get "notes" formData
                 |> Maybe.andThen
@@ -610,6 +628,7 @@ handleUpdateRecord model idStr request response =
                     , artist = artist
                     , title = title
                     , year = year
+                    , month = month
                     , notes = notes
                     }
                     |> Task.attempt (\result -> RecordUpdated { response = response, result = result })
@@ -1044,6 +1063,7 @@ recordsListPage records =
                             [ H.th [] [ H.text "Artist" ]
                             , H.th [] [ H.text "Title" ]
                             , H.th [] [ H.text "Year" ]
+                            , H.th [] [ H.text "Month" ]
                             , H.th [] [ H.text "Plays" ]
                             , H.th [] [ H.text "Actions" ]
                             ]
@@ -1067,11 +1087,20 @@ recordRow record =
 
                 Just year ->
                     String.fromInt year
+
+        monthStr =
+            when record.month is
+                Nothing ->
+                    "-"
+
+                Just month ->
+                    String.fromInt month
     in
     H.tr []
         [ H.td [] [ H.text record.artist ]
         , H.td [] [ H.text record.title ]
         , H.td [] [ H.text yearStr ]
+        , H.td [] [ H.text monthStr ]
         , H.td [] [ H.text (String.fromInt record.playCount) ]
         , H.td [ A.class "actions" ]
             [ H.a [ A.href ("/records/" ++ idStr ++ "/edit") ] [ H.text "Edit" ]
@@ -1110,6 +1139,12 @@ recordForm maybeRecord =
         yearValue =
             maybeRecord
                 |> Maybe.andThen .year
+                |> Maybe.map String.fromInt
+                |> Maybe.withDefault ""
+
+        monthValue =
+            maybeRecord
+                |> Maybe.andThen .month
                 |> Maybe.map String.fromInt
                 |> Maybe.withDefault ""
 
@@ -1158,6 +1193,18 @@ recordForm maybeRecord =
                 , A.value yearValue
                 , A.attribute "min" "1900"
                 , A.attribute "max" "2100"
+                ]
+                []
+            ]
+        , H.div []
+            [ H.label [ A.for "month" ] [ H.text "Month (optional)" ]
+            , H.input
+                [ A.type_ "number"
+                , A.name "month"
+                , A.id "month"
+                , A.value monthValue
+                , A.attribute "min" "1"
+                , A.attribute "max" "12"
                 ]
                 []
             ]

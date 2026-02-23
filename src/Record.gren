@@ -40,6 +40,7 @@ type alias Record =
     , artist : String
     , title : String
     , year : Maybe Int
+    , month : Maybe Int
     , notes : Maybe String
     , lastPlayedAt : Maybe Int
     , playCount : Int
@@ -56,9 +57,9 @@ getAllRecords connection =
     Db.getAll connection
         { query =
             """
-            SELECT id, artist, title, year, notes, last_played_at, play_count, created_at
+            SELECT id, artist, title, year, month, notes, last_played_at, play_count, created_at
             FROM records
-            ORDER BY artist ASC, year ASC, title ASC
+            ORDER BY artist ASC, year ASC, month ASC, title ASC
             """
         , parameters = []
         , decoder = recordDecoder
@@ -68,7 +69,7 @@ getAllRecords connection =
 getRecord : Db.Connection -> RecordId -> Task Db.Error (Maybe Record)
 getRecord connection recordId =
     Db.getMaybeOne connection
-        { query = "SELECT id, artist, title, year, notes, last_played_at, play_count, created_at FROM records WHERE id = :id"
+        { query = "SELECT id, artist, title, year, month, notes, last_played_at, play_count, created_at FROM records WHERE id = :id"
         , parameters = [ Encode.int "id" (recordIdToInt recordId) ]
         , decoder = recordDecoder
         }
@@ -84,17 +85,19 @@ createRecord :
         { artist : String
         , title : String
         , year : Maybe Int
+        , month : Maybe Int
         , notes : Maybe String
         , createdAt : Int
         }
     -> Task Db.Error {}
 createRecord connection newRecord =
     Db.execute connection
-        { statement = "INSERT INTO records (artist, title, year, notes, play_count, created_at) VALUES (:artist, :title, :year, :notes, 0, :created_at)"
+        { statement = "INSERT INTO records (artist, title, year, month, notes, play_count, created_at) VALUES (:artist, :title, :year, :month, :notes, 0, :created_at)"
         , parameters =
             [ Encode.string "artist" newRecord.artist
             , Encode.string "title" newRecord.title
             , encodeMaybeInt "year" newRecord.year
+            , encodeMaybeInt "month" newRecord.month
             , encodeMaybeString "notes" newRecord.notes
             , Encode.int "created_at" newRecord.createdAt
             ]
@@ -109,17 +112,19 @@ updateRecord :
         , artist : String
         , title : String
         , year : Maybe Int
+        , month : Maybe Int
         , notes : Maybe String
         }
     -> Task Db.Error {}
 updateRecord connection record =
     Db.execute connection
-        { statement = "UPDATE records SET artist = :artist, title = :title, year = :year, notes = :notes WHERE id = :id"
+        { statement = "UPDATE records SET artist = :artist, title = :title, year = :year, month = :month, notes = :notes WHERE id = :id"
         , parameters =
             [ Encode.int "id" (recordIdToInt record.id)
             , Encode.string "artist" record.artist
             , Encode.string "title" record.title
             , encodeMaybeInt "year" record.year
+            , encodeMaybeInt "month" record.month
             , encodeMaybeString "notes" record.notes
             ]
         }
@@ -272,6 +277,7 @@ recordDecoder =
     Decode.field Decode.string "artist" <| \artist ->
     Decode.field Decode.string "title" <| \title ->
     Decode.field (Decode.maybe Decode.int) "year" <| \year ->
+    Decode.field (Decode.maybe Decode.int) "month" <| \month ->
     Decode.field (Decode.maybe Decode.string) "notes" <| \notes ->
     Decode.field (Decode.maybe Decode.int) "last_played_at" <| \lastPlayedAt ->
     Decode.field Decode.int "play_count" <| \playCount ->
@@ -281,6 +287,7 @@ recordDecoder =
         , artist = artist
         , title = title
         , year = year
+        , month = month
         , notes = notes
         , lastPlayedAt = lastPlayedAt
         , playCount = playCount
