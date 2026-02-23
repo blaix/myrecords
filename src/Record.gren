@@ -54,7 +54,12 @@ type alias Record =
 getAllRecords : Db.Connection -> Task Db.Error (Array Record)
 getAllRecords connection =
     Db.getAll connection
-        { query = "SELECT id, artist, title, year, notes, last_played_at, play_count, created_at FROM records ORDER BY artist ASC, title ASC"
+        { query =
+            """
+            SELECT id, artist, title, year, notes, last_played_at, play_count, created_at
+            FROM records
+            ORDER BY artist ASC, year ASC, title ASC
+            """
         , parameters = []
         , decoder = recordDecoder
         }
