@@ -156,21 +156,17 @@ markAsPlayed connection recordId nowMs =
 -- WEIGHTED SELECTION ALGORITHM
 
 
-type alias RecordWithWeight =
-    { record : Record
-    , weight : Float
-    }
-
-
 {-| Calculate weight based on days since last played.
     Weight = daysSincePlayed ^ 1.5 (exponential favors older plays)
     Never-played records get 365 days worth of weight.
+
+    TODO: evaluate if this is weighted the way I want
 -}
-calculateWeight : Int -> Record -> RecordWithWeight
+calculateWeight : Int -> Record -> { value : Record, weight: Float }
 calculateWeight nowMs record =
     let
         msPerDay =
-            86400000
+            24 * 60 * 60 * 1000
 
         daysSincePlayed =
             when record.lastPlayedAt is
@@ -190,57 +186,30 @@ calculateWeight nowMs record =
         weight =
             daysSincePlayed ^ 1.5
     in
-    { record = record
+    { value = record
     , weight = weight
     }
 
 
-{-| Select a random record using weighted random selection.
-    Uses the provided seed (typically current timestamp) for randomness.
+{-| Select a random record weighted by least recently played.
+    Provide seed as first argument (usually currently timestamp).
 -}
 selectNextRecord : Int -> Array Record -> Maybe Record
 selectNextRecord seed records =
-    if Array.isEmpty records then
-        Nothing
-    else
-        let
-            recordsWithWeights =
-                Array.map (calculateWeight seed) records
+    let
+        recordsWithWeights =
+            Array.map (calculateWeight seed) records
+    in
+    when Array.popFirst recordsWithWeights is
+        Just { first, rest } ->
+            Random.step
+                (Random.weighted first rest)
+                (Random.initialSeed seed)
+                    |> .value
+                    |> Just
 
-            totalWeight =
-                Array.foldl (\rw acc -> acc + rw.weight) 0.0 recordsWithWeights
-
-            generator =
-                Random.float 0 totalWeight
-
-            { value } =
-                Random.step generator (Random.initialSeed seed)
-        in
-        selectByWeight value recordsWithWeights
-
-
-{-| Walk through weighted records and select one based on random value.
--}
-selectByWeight : Float -> Array RecordWithWeight -> Maybe Record
-selectByWeight target recordsWithWeights =
-    selectByWeightHelper target 0.0 recordsWithWeights
-
-
-selectByWeightHelper : Float -> Float -> Array RecordWithWeight -> Maybe Record
-selectByWeightHelper target cumulative recordsWithWeights =
-    when Array.first recordsWithWeights is
         Nothing ->
             Nothing
-
-        Just rw ->
-            let
-                newCumulative =
-                    cumulative + rw.weight
-            in
-            if target <= newCumulative then
-                Just rw.record
-            else
-                selectByWeightHelper target newCumulative (Array.dropFirst 1 recordsWithWeights)
 
 
 
