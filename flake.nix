@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    ws4sql.url = "path:./nixpkgs/ws4sql";
+    ws4sql.url = "github:blaix/ws4sql-nix";
     process-compose-flake.url = "github:Platonic-Systems/process-compose-flake";
   };
 
