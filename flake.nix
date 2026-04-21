@@ -10,7 +10,7 @@
   outputs = { self, nixpkgs, ws4sql, process-compose-flake }:
     let
       # Support both Mac (development) and Linux (production)
-      supportedSystems = [ "x86_64-linux" "aarch64-darwin" ];
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
 
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
 
