@@ -8,6 +8,7 @@ import HttpClient
 import HttpServer exposing (Request, Server)
 import HttpServer.Response as Response exposing (Response)
 import Init
+import Math
 import Node exposing (Environment)
 import Record exposing (Record, RecordId)
 import Stream.Log
@@ -172,18 +173,18 @@ type Msg
     | GotRequest { request : Request, response : Response }
     | SchemaInitialized (Result Db.Error {})
     -- Records
-    | GotRecords { response : Response, result : Result Db.Error (Array Record) }
+    | GotRecords { response : Response, prefillArtist : Maybe String, result : Result Db.Error (Array Record) }
     | GotRecord { response : Response, recordId : String, result : Result Db.Error (Maybe Record) }
     | RecordCreated { response : Response, result : Result Db.Error {} }
     | RecordUpdated { response : Response, result : Result Db.Error {} }
     | RecordDeleted { response : Response, result : Result Db.Error {} }
-    | RecordMarkedPlayed { response : Response, result : Result Db.Error {} }
+    | RecordMarkedPlayed { response : Response, recordId : RecordId, result : Result Db.Error {} }
     -- Home page
-    | GotRecordsForHome { response : Response, nowMs : Int, result : Result Db.Error (Array Record) }
+    | GotRecordsForHome { response : Response, nowMs : Int, playingId : Maybe RecordId, result : Result Db.Error (Array Record) }
     | GotRecordsForPick { response : Response, nowMs : Int, result : Result Db.Error (Array Record) }
     -- Time
     | GotTimeForCreate { response : Response, formData : Dict String String, time : Time.Posix }
-    | GotTimeForHome { response : Response, time : Time.Posix }
+    | GotTimeForHome { response : Response, playingId : Maybe RecordId, time : Time.Posix }
     | GotTimeForPick { response : Response, time : Time.Posix }
     | GotTimeForPlayed { response : Response, recordId : RecordId, time : Time.Posix }
 
@@ -239,11 +240,11 @@ update msg model =
             handleRequest model request response
 
         -- Records
-        GotRecords { response, result } ->
+        GotRecords { response, prefillArtist, result } ->
             when result is
                 Ok records ->
                     { model = model
-                    , command = sendHtml response (recordsListPage records)
+                    , command = sendHtml response (recordsListPage prefillArtist records)
                     }
 
                 Err error ->
@@ -306,11 +307,13 @@ update msg model =
                     , command = sendError response 500 ("Failed to delete record: " ++ Db.errorToString error)
                     }
 
-        RecordMarkedPlayed { response, result } ->
+        RecordMarkedPlayed { response, recordId, result } ->
             when result is
                 Ok _ ->
                     { model = model
-                    , command = redirect response "/"
+                    , command =
+                        redirect response
+                            ("/?playing=" ++ String.fromInt (Record.recordIdToInt recordId))
                     }
 
                 Err error ->
@@ -319,15 +322,38 @@ update msg model =
                     }
 
         -- Home page
-        GotRecordsForHome { response, nowMs, result } ->
+        GotRecordsForHome { response, nowMs, playingId, result } ->
             when result is
                 Ok records ->
                     let
-                        suggestion =
-                            Record.selectNextRecord nowMs records
+                        playingRecord =
+                            when playingId is
+                                Just id ->
+                                    Array.findFirst
+                                        (\r -> Record.recordIdToInt r.id == Record.recordIdToInt id)
+                                        records
+                                        |> Maybe.map .value
+
+                                Nothing ->
+                                    Nothing
+
+                        record =
+                            when playingRecord is
+                                Just r ->
+                                    Just r
+
+                                Nothing ->
+                                    Record.selectNextRecord nowMs records
                     in
                     { model = model
-                    , command = sendHtml response (homePage suggestion)
+                    , command =
+                        sendHtml response
+                            (homePage
+                                { record = record
+                                , nowPlaying = playingRecord /= Nothing
+                                , nextOnShelf = Maybe.andThen (\r -> nextAfter r records) record
+                                }
+                            )
                     }
 
                 Err error ->
@@ -343,7 +369,14 @@ update msg model =
                             Record.selectNextRecord nowMs records
                     in
                     { model = model
-                    , command = sendHtml response (homePage suggestion)
+                    , command =
+                        sendHtml response
+                            (homePage
+                                { record = suggestion
+                                , nowPlaying = False
+                                , nextOnShelf = Maybe.andThen (\s -> nextAfter s records) suggestion
+                                }
+                            )
                     }
 
                 Err error ->
@@ -355,7 +388,7 @@ update msg model =
         GotTimeForCreate { response, formData, time } ->
             handleCreateRecordWithTime model response formData (Time.posixToMillis time)
 
-        GotTimeForHome { response, time } ->
+        GotTimeForHome { response, playingId, time } ->
             let
                 nowMs =
                     Time.posixToMillis time
@@ -363,7 +396,15 @@ update msg model =
             { model = model
             , command =
                 Record.getAllRecords model.dbConnection
-                    |> Task.attempt (\result -> GotRecordsForHome { response = response, nowMs = nowMs, result = result })
+                    |> Task.attempt
+                        (\result ->
+                            GotRecordsForHome
+                                { response = response
+                                , nowMs = nowMs
+                                , playingId = playingId
+                                , result = result
+                                }
+                        )
             }
 
         GotTimeForPick { response, time } ->
@@ -385,7 +426,14 @@ update msg model =
             { model = model
             , command =
                 Record.markAsPlayed model.dbConnection recordId nowMs
-                    |> Task.attempt (\result -> RecordMarkedPlayed { response = response, result = result })
+                    |> Task.attempt
+                        (\result ->
+                            RecordMarkedPlayed
+                                { response = response
+                                , recordId = recordId
+                                , result = result
+                                }
+                        )
             }
 
 
@@ -397,10 +445,23 @@ handleRequest : Model -> Request -> Response -> { model : Model, command : Cmd M
 handleRequest model request response =
     when Array.dropFirst 1 (String.split "/" request.url.path) is
         [ "" ] ->
+            let
+                playingId =
+                    Dict.get "playing" (parseQueryString request.url.query)
+                        |> Maybe.andThen String.toInt
+                        |> Maybe.map Record.recordIdFromInt
+            in
             { model = model
             , command =
                 Time.now
-                    |> Task.perform (\time -> GotTimeForHome { response = response, time = time })
+                    |> Task.perform
+                        (\time ->
+                            GotTimeForHome
+                                { response = response
+                                , playingId = playingId
+                                , time = time
+                                }
+                        )
             }
 
         -- Static files
@@ -428,10 +489,14 @@ handleRequest model request response =
         [ "records" ] ->
             when request.method is
                 HttpServer.GET ->
+                    let
+                        prefillArtist =
+                            Dict.get "artist" (parseQueryString request.url.query)
+                    in
                     { model = model
                     , command =
                         Record.getAllRecords model.dbConnection
-                            |> Task.attempt (\result -> GotRecords { response = response, result = result })
+                            |> Task.attempt (\result -> GotRecords { response = response, prefillArtist = prefillArtist, result = result })
                     }
 
                 HttpServer.POST ->
@@ -670,6 +735,42 @@ decodeFormValue value =
         |> String.replace "+" " "
         |> Url.percentDecode
         |> Maybe.withDefault value
+
+
+parseQueryString : Maybe String -> Dict String String
+parseQueryString maybeQuery =
+    when maybeQuery is
+        Nothing ->
+            Dict.empty
+
+        Just query ->
+            query
+                |> String.split "&"
+                |> Array.foldl
+                    (\pair acc ->
+                        when String.split "=" pair is
+                            [ key, value ] ->
+                                Dict.set (decodeFormValue key) (decodeFormValue value) acc
+
+                            _ ->
+                                acc
+                    )
+                    Dict.empty
+
+
+nextAfter : Record -> Array Record -> Maybe Record
+nextAfter picked sorted =
+    let
+        len =
+            Array.length sorted
+    in
+    if len <= 1 then
+        Nothing
+    else
+        Array.findFirst
+            (\r -> Record.recordIdToInt r.id == Record.recordIdToInt picked.id)
+            sorted
+            |> Maybe.andThen (\found -> Array.get (Math.modBy len (found.index + 1)) sorted)
 
 
 
@@ -916,6 +1017,45 @@ button[type="submit"]:hover {
 .no-records a {
     color: #007bff;
 }
+
+.next-on-shelf {
+    text-align: center;
+    padding: 1rem 1.5rem;
+    background-color: #f8f9fa;
+    border: 1px solid #e1e4e8;
+    border-radius: 8px;
+    margin: -1rem 0 2rem 0;
+    color: #333;
+}
+
+.next-on-shelf h3 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1rem;
+    font-weight: normal;
+    color: #666;
+}
+
+.next-on-shelf .next-record {
+    font-size: 1.1rem;
+    margin: 0.25rem 0 0.75rem 0;
+}
+
+.next-on-shelf .next-artist {
+    font-weight: bold;
+}
+
+.next-on-shelf .next-title {
+    font-style: italic;
+}
+
+.next-on-shelf .next-prompt {
+    font-size: 0.85rem;
+    color: #666;
+}
+
+.next-on-shelf .next-add {
+    color: #007bff;
+}
 """
 
 
@@ -978,13 +1118,13 @@ errorPage status message =
 -- HOME PAGE
 
 
-homePage : Maybe Record -> String
-homePage maybeSuggestion =
+homePage : { record : Maybe Record, nowPlaying : Bool, nextOnShelf : Maybe Record } -> String
+homePage { record, nowPlaying, nextOnShelf } =
     layout
         { title = "MyRecords"
         , body =
             [ H.h1 [] [ H.text "What to Play?" ]
-            , when maybeSuggestion is
+            , when record is
                 Nothing ->
                     H.div [ A.class "no-records" ]
                         [ H.p [] [ H.text "No records in your collection yet!" ]
@@ -994,10 +1134,50 @@ homePage maybeSuggestion =
                             ]
                         ]
 
-                Just record ->
-                    suggestionCard record
+                Just r ->
+                    H.div []
+                        [ if nowPlaying then
+                            nowPlayingCard r
+                          else
+                            suggestionCard r
+                        , when nextOnShelf is
+                            Nothing ->
+                                H.text ""
+
+                            Just next ->
+                                nextOnShelfPanel r next
+                        ]
             ]
         }
+
+
+nextOnShelfPanel : Record -> Record -> Html msg
+nextOnShelfPanel picked next =
+    let
+        yearStr =
+            when next.year is
+                Nothing ->
+                    ""
+
+                Just year ->
+                    " (" ++ String.fromInt year ++ ")"
+
+        addUrl =
+            "/records?artist=" ++ Url.percentEncode picked.artist
+    in
+    H.div [ A.class "next-on-shelf" ]
+        [ H.h3 [] [ H.text "Next on your shelf?" ]
+        , H.div [ A.class "next-record" ]
+            [ H.span [ A.class "next-artist" ] [ H.text next.artist ]
+            , H.text " — "
+            , H.span [ A.class "next-title" ] [ H.text next.title ]
+            , H.text yearStr
+            ]
+        , H.div [ A.class "next-prompt" ]
+            [ H.text "Not what's there? "
+            , H.a [ A.href addUrl, A.class "next-add" ] [ H.text "Add the missing one" ]
+            ]
+        ]
 
 
 suggestionCard : Record -> Html msg
@@ -1032,9 +1212,35 @@ suggestionCard record =
             ]
         , H.div [ A.class "suggestion-actions" ]
             [ H.form [ A.method "post", A.action ("/records/" ++ idStr ++ "/played") ]
-                [ H.button [ A.type_ "submit", A.class "play-btn" ] [ H.text "I played it!" ]
+                [ H.button [ A.type_ "submit", A.class "play-btn" ] [ H.text "Play it" ]
                 ]
             , H.form [ A.method "post", A.action "/pick" ]
+                [ H.button [ A.type_ "submit", A.class "pick-btn" ] [ H.text "Pick another" ]
+                ]
+            ]
+        ]
+
+
+nowPlayingCard : Record -> Html msg
+nowPlayingCard record =
+    H.div [ A.class "suggestion now-playing" ]
+        [ H.h2 [] [ H.text "Now playing" ]
+        , H.div [ A.class "artist" ] [ H.text record.artist ]
+        , H.div [ A.class "title" ] [ H.text record.title ]
+        , when record.year is
+            Nothing ->
+                H.text ""
+
+            Just year ->
+                H.div [ A.class "year" ] [ H.text ("(" ++ String.fromInt year ++ ")") ]
+        , when record.notes is
+            Nothing ->
+                H.text ""
+
+            Just notes ->
+                H.div [ A.class "notes" ] [ H.text notes ]
+        , H.div [ A.class "suggestion-actions" ]
+            [ H.form [ A.method "post", A.action "/pick" ]
                 [ H.button [ A.type_ "submit", A.class "pick-btn" ] [ H.text "Pick another" ]
                 ]
             ]
@@ -1045,14 +1251,14 @@ suggestionCard record =
 -- RECORDS LIST PAGE
 
 
-recordsListPage : Array Record -> String
-recordsListPage records =
+recordsListPage : Maybe String -> Array Record -> String
+recordsListPage prefillArtist records =
     layout
         { title = "Records - MyRecords"
         , body =
             [ H.h1 [] [ H.text "My Record Collection" ]
             , H.h2 [] [ H.text "Add New Record" ]
-            , recordForm Nothing
+            , recordForm { existing = Nothing, prefillArtist = prefillArtist }
             , H.h2 [] [ H.text "Current Records" ]
             , if Array.isEmpty records then
                 H.p [] [ H.text "No records yet. Add one above!" ]
@@ -1115,9 +1321,12 @@ recordRow record =
         ]
 
 
-recordForm : Maybe Record -> Html msg
-recordForm maybeRecord =
+recordForm : { existing : Maybe Record, prefillArtist : Maybe String } -> Html msg
+recordForm { existing, prefillArtist } =
     let
+        maybeRecord =
+            existing
+
         action =
             when maybeRecord is
                 Nothing ->
@@ -1127,9 +1336,12 @@ recordForm maybeRecord =
                     "/records/" ++ String.fromInt (Record.recordIdToInt record.id)
 
         artistValue =
-            maybeRecord
-                |> Maybe.map .artist
-                |> Maybe.withDefault ""
+            when maybeRecord is
+                Just record ->
+                    record.artist
+
+                Nothing ->
+                    Maybe.withDefault "" prefillArtist
 
         titleValue =
             maybeRecord
@@ -1229,7 +1441,7 @@ editRecordPage record =
         , body =
             [ H.h1 [] [ H.text "Edit Record" ]
             , H.p [] [ H.a [ A.href "/records" ] [ H.text "Back to Records" ] ]
-            , recordForm (Just record)
+            , recordForm { existing = Just record, prefillArtist = Nothing }
             ]
         }
 
