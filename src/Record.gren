@@ -10,6 +10,7 @@ module Record exposing
     , deleteRecord
     , markAsPlayed
     , selectNextRecord
+    , shelfSort
     )
 
 import Array exposing (Array)
@@ -42,6 +43,7 @@ type alias Record =
     , year : Maybe Int
     , month : Maybe Int
     , notes : Maybe String
+    , is7Inch : Bool
     , lastPlayedAt : Maybe Int
     , playCount : Int
     , createdAt : Int
@@ -57,7 +59,7 @@ getAllRecords connection =
     Db.getAll connection
         { query =
             """
-            SELECT id, artist, title, year, month, notes, last_played_at, play_count, created_at
+            SELECT id, artist, title, year, month, notes, seven_inch, last_played_at, play_count, created_at
             FROM records
             ORDER BY artist ASC, year ASC, month ASC, title ASC
             """
@@ -69,7 +71,7 @@ getAllRecords connection =
 getRecord : Db.Connection -> RecordId -> Task Db.Error (Maybe Record)
 getRecord connection recordId =
     Db.getMaybeOne connection
-        { query = "SELECT id, artist, title, year, month, notes, last_played_at, play_count, created_at FROM records WHERE id = :id"
+        { query = "SELECT id, artist, title, year, month, notes, seven_inch, last_played_at, play_count, created_at FROM records WHERE id = :id"
         , parameters = [ Encode.int "id" (recordIdToInt recordId) ]
         , decoder = recordDecoder
         }
@@ -87,18 +89,20 @@ createRecord :
         , year : Maybe Int
         , month : Maybe Int
         , notes : Maybe String
+        , is7Inch : Bool
         , createdAt : Int
         }
     -> Task Db.Error {}
 createRecord connection newRecord =
     Db.execute connection
-        { statement = "INSERT INTO records (artist, title, year, month, notes, play_count, created_at) VALUES (:artist, :title, :year, :month, :notes, 0, :created_at)"
+        { statement = "INSERT INTO records (artist, title, year, month, notes, seven_inch, play_count, created_at) VALUES (:artist, :title, :year, :month, :notes, :seven_inch, 0, :created_at)"
         , parameters =
             [ Encode.string "artist" newRecord.artist
             , Encode.string "title" newRecord.title
             , encodeMaybeInt "year" newRecord.year
             , encodeMaybeInt "month" newRecord.month
             , encodeMaybeString "notes" newRecord.notes
+            , encodeBool "seven_inch" newRecord.is7Inch
             , Encode.int "created_at" newRecord.createdAt
             ]
         }
@@ -114,11 +118,12 @@ updateRecord :
         , year : Maybe Int
         , month : Maybe Int
         , notes : Maybe String
+        , is7Inch : Bool
         }
     -> Task Db.Error {}
 updateRecord connection record =
     Db.execute connection
-        { statement = "UPDATE records SET artist = :artist, title = :title, year = :year, month = :month, notes = :notes WHERE id = :id"
+        { statement = "UPDATE records SET artist = :artist, title = :title, year = :year, month = :month, notes = :notes, seven_inch = :seven_inch WHERE id = :id"
         , parameters =
             [ Encode.int "id" (recordIdToInt record.id)
             , Encode.string "artist" record.artist
@@ -126,6 +131,7 @@ updateRecord connection record =
             , encodeMaybeInt "year" record.year
             , encodeMaybeInt "month" record.month
             , encodeMaybeString "notes" record.notes
+            , encodeBool "seven_inch" record.is7Inch
             ]
         }
         |> Task.map (\_ -> {})
@@ -213,6 +219,20 @@ selectNextRecord seed records =
 
 
 
+-- SHELF ORDER
+
+
+{-| Reorder records so 7" singles come before the rest, preserving the existing
+    order within each section. Used only for the "Next on your shelf?" adjacency.
+-}
+shelfSort : Array Record -> Array Record
+shelfSort records =
+    Array.append
+        (Array.keepIf .is7Inch records)
+        (Array.keepIf (\r -> not r.is7Inch) records)
+
+
+
 -- HELPERS
 
 
@@ -236,6 +256,11 @@ encodeMaybeString name maybeValue =
             Encode.string name value
 
 
+encodeBool : String -> Bool -> Encode.Value
+encodeBool name value =
+    Encode.int name (if value then 1 else 0)
+
+
 
 -- DECODER
 
@@ -248,6 +273,7 @@ recordDecoder =
     Decode.field (Decode.maybe Decode.int) "year" <| \year ->
     Decode.field (Decode.maybe Decode.int) "month" <| \month ->
     Decode.field (Decode.maybe Decode.string) "notes" <| \notes ->
+    Decode.field Decode.int "seven_inch" <| \sevenInch ->
     Decode.field (Decode.maybe Decode.int) "last_played_at" <| \lastPlayedAt ->
     Decode.field Decode.int "play_count" <| \playCount ->
     Decode.field Decode.int "created_at" <| \createdAt ->
@@ -258,6 +284,7 @@ recordDecoder =
         , year = year
         , month = month
         , notes = notes
+        , is7Inch = sevenInch /= 0
         , lastPlayedAt = lastPlayedAt
         , playCount = playCount
         , createdAt = createdAt

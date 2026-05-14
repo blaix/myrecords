@@ -146,6 +146,7 @@ initializeSchema connection =
                 year INTEGER,
                 month INTEGER,
                 notes TEXT,
+                seven_inch INTEGER NOT NULL DEFAULT 0,
                 last_played_at INTEGER,
                 play_count INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
@@ -157,6 +158,14 @@ initializeSchema connection =
             (\_ ->
                 Db.execute connection
                     { statement = "ALTER TABLE records ADD COLUMN month INTEGER"
+                    , parameters = []
+                    }
+                    |> Task.onError (\_ -> Task.succeed 0)
+            )
+        |> Task.andThen
+            (\_ ->
+                Db.execute connection
+                    { statement = "ALTER TABLE records ADD COLUMN seven_inch INTEGER NOT NULL DEFAULT 0"
                     , parameters = []
                     }
                     |> Task.onError (\_ -> Task.succeed 0)
@@ -351,7 +360,7 @@ update msg model =
                             (homePage
                                 { record = record
                                 , nowPlaying = playingRecord /= Nothing
-                                , nextOnShelf = Maybe.andThen (\r -> nextAfter r records) record
+                                , nextOnShelf = Maybe.andThen (\r -> nextAfter r (Record.shelfSort records)) record
                                 }
                             )
                     }
@@ -374,7 +383,7 @@ update msg model =
                             (homePage
                                 { record = suggestion
                                 , nowPlaying = False
-                                , nextOnShelf = Maybe.andThen (\s -> nextAfter s records) suggestion
+                                , nextOnShelf = Maybe.andThen (\s -> nextAfter s (Record.shelfSort records)) suggestion
                                 }
                             )
                     }
@@ -629,6 +638,9 @@ handleCreateRecordWithTime model response formData nowMs =
                         else
                             Just n
                     )
+
+        is7Inch =
+            Dict.member "seven_inch" formData
     in
     when { artist = maybeArtist, title = maybeTitle } is
         { artist = Just artist, title = Just title } ->
@@ -640,6 +652,7 @@ handleCreateRecordWithTime model response formData nowMs =
                     , year = year
                     , month = month
                     , notes = notes
+                    , is7Inch = is7Inch
                     , createdAt = nowMs
                     }
                     |> Task.attempt (\result -> RecordCreated { response = response, result = result })
@@ -683,6 +696,9 @@ handleUpdateRecord model idStr request response =
                         else
                             Just n
                     )
+
+        is7Inch =
+            Dict.member "seven_inch" formData
     in
     when { id = maybeId, artist = maybeArtist, title = maybeTitle } is
         { id = Just id, artist = Just artist, title = Just title } ->
@@ -695,6 +711,7 @@ handleUpdateRecord model idStr request response =
                     , year = year
                     , month = month
                     , notes = notes
+                    , is7Inch = is7Inch
                     }
                     |> Task.attempt (\result -> RecordUpdated { response = response, result = result })
             }
@@ -1304,7 +1321,12 @@ recordRow record =
     in
     H.tr []
         [ H.td [] [ H.text record.artist ]
-        , H.td [] [ H.text record.title ]
+        , H.td []
+            (if record.is7Inch then
+                [ H.text record.title, H.text " (7\")" ]
+             else
+                [ H.text record.title ]
+            )
         , H.td [] [ H.text yearStr ]
         , H.td [] [ H.text monthStr ]
         , H.td [] [ H.text (String.fromInt record.playCount) ]
@@ -1364,6 +1386,11 @@ recordForm { existing, prefillArtist } =
             maybeRecord
                 |> Maybe.andThen .notes
                 |> Maybe.withDefault ""
+
+        is7InchValue =
+            maybeRecord
+                |> Maybe.map .is7Inch
+                |> Maybe.withDefault False
 
         buttonText =
             when maybeRecord is
@@ -1427,6 +1454,20 @@ recordForm { existing, prefillArtist } =
                 , A.id "notes"
                 ]
                 [ H.text notesValue ]
+            ]
+        , H.div []
+            [ H.label [ A.for "seven_inch" ]
+                [ H.input
+                    ([ A.type_ "checkbox"
+                     , A.name "seven_inch"
+                     , A.id "seven_inch"
+                     , A.value "1"
+                     ]
+                        ++ (if is7InchValue then [ A.attribute "checked" "checked" ] else [])
+                    )
+                    []
+                , H.text " 7\" single"
+                ]
             ]
         , H.div []
             [ H.button [ A.type_ "submit" ] [ H.text buttonText ]
