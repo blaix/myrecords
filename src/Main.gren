@@ -1458,13 +1458,12 @@ recordForm { existing, prefillArtist } =
         , H.div []
             [ H.label [ A.for "seven_inch" ]
                 [ H.input
-                    ([ A.type_ "checkbox"
-                     , A.name "seven_inch"
-                     , A.id "seven_inch"
-                     , A.value "1"
-                     ]
-                        ++ (if is7InchValue then [ A.attribute "checked" "checked" ] else [])
-                    )
+                    [ A.type_ "checkbox"
+                    , A.name "seven_inch"
+                    , A.id "seven_inch"
+                    , A.value "1"
+                    , A.checked is7InchValue
+                    ]
                     []
                 , H.text " 7\" single"
                 ]
