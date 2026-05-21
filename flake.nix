@@ -101,6 +101,7 @@ EOF
               pkgs.gren
               pkgs.nodejs
               pkgs.fd
+              pkgs.sqlite
               ws4sql.packages.${system}.default
             ];
 
