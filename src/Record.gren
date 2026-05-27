@@ -42,6 +42,7 @@ type alias Record =
     , title : String
     , year : Maybe Int
     , month : Maybe Int
+    , yearReleased : Maybe Int
     , notes : Maybe String
     , is7Inch : Bool
     , lastPlayedAt : Maybe Int
@@ -59,7 +60,7 @@ getAllRecords connection =
     Db.getAll connection
         { query =
             """
-            SELECT id, artist, title, year, month, notes, seven_inch, last_played_at, play_count, created_at
+            SELECT id, artist, title, year, month, year_released, notes, seven_inch, last_played_at, play_count, created_at
             FROM records
             ORDER BY artist ASC, year ASC, month ASC, title ASC
             """
@@ -71,7 +72,7 @@ getAllRecords connection =
 getRecord : Db.Connection -> RecordId -> Task Db.Error (Maybe Record)
 getRecord connection recordId =
     Db.getMaybeOne connection
-        { query = "SELECT id, artist, title, year, month, notes, seven_inch, last_played_at, play_count, created_at FROM records WHERE id = :id"
+        { query = "SELECT id, artist, title, year, month, year_released, notes, seven_inch, last_played_at, play_count, created_at FROM records WHERE id = :id"
         , parameters = [ Encode.int "id" (recordIdToInt recordId) ]
         , decoder = recordDecoder
         }
@@ -88,6 +89,7 @@ createRecord :
         , title : String
         , year : Maybe Int
         , month : Maybe Int
+        , yearReleased : Maybe Int
         , notes : Maybe String
         , is7Inch : Bool
         , createdAt : Int
@@ -95,12 +97,13 @@ createRecord :
     -> Task Db.Error {}
 createRecord connection newRecord =
     Db.execute connection
-        { statement = "INSERT INTO records (artist, title, year, month, notes, seven_inch, play_count, created_at) VALUES (:artist, :title, :year, :month, :notes, :seven_inch, 0, :created_at)"
+        { statement = "INSERT INTO records (artist, title, year, month, year_released, notes, seven_inch, play_count, created_at) VALUES (:artist, :title, :year, :month, :year_released, :notes, :seven_inch, 0, :created_at)"
         , parameters =
             [ Encode.string "artist" newRecord.artist
             , Encode.string "title" newRecord.title
             , encodeMaybeInt "year" newRecord.year
             , encodeMaybeInt "month" newRecord.month
+            , encodeMaybeInt "year_released" newRecord.yearReleased
             , encodeMaybeString "notes" newRecord.notes
             , encodeBool "seven_inch" newRecord.is7Inch
             , Encode.int "created_at" newRecord.createdAt
@@ -117,19 +120,21 @@ updateRecord :
         , title : String
         , year : Maybe Int
         , month : Maybe Int
+        , yearReleased : Maybe Int
         , notes : Maybe String
         , is7Inch : Bool
         }
     -> Task Db.Error {}
 updateRecord connection record =
     Db.execute connection
-        { statement = "UPDATE records SET artist = :artist, title = :title, year = :year, month = :month, notes = :notes, seven_inch = :seven_inch WHERE id = :id"
+        { statement = "UPDATE records SET artist = :artist, title = :title, year = :year, month = :month, year_released = :year_released, notes = :notes, seven_inch = :seven_inch WHERE id = :id"
         , parameters =
             [ Encode.int "id" (recordIdToInt record.id)
             , Encode.string "artist" record.artist
             , Encode.string "title" record.title
             , encodeMaybeInt "year" record.year
             , encodeMaybeInt "month" record.month
+            , encodeMaybeInt "year_released" record.yearReleased
             , encodeMaybeString "notes" record.notes
             , encodeBool "seven_inch" record.is7Inch
             ]
@@ -272,6 +277,7 @@ recordDecoder =
     Decode.field Decode.string "title" <| \title ->
     Decode.field (Decode.maybe Decode.int) "year" <| \year ->
     Decode.field (Decode.maybe Decode.int) "month" <| \month ->
+    Decode.field (Decode.maybe Decode.int) "year_released" <| \yearReleased ->
     Decode.field (Decode.maybe Decode.string) "notes" <| \notes ->
     Decode.field Decode.int "seven_inch" <| \sevenInch ->
     Decode.field (Decode.maybe Decode.int) "last_played_at" <| \lastPlayedAt ->
@@ -283,6 +289,7 @@ recordDecoder =
         , title = title
         , year = year
         , month = month
+        , yearReleased = yearReleased
         , notes = notes
         , is7Inch = sevenInch /= 0
         , lastPlayedAt = lastPlayedAt

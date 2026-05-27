@@ -145,6 +145,7 @@ initializeSchema connection =
                 title TEXT NOT NULL,
                 year INTEGER,
                 month INTEGER,
+                year_released INTEGER,
                 notes TEXT,
                 seven_inch INTEGER NOT NULL DEFAULT 0,
                 last_played_at INTEGER,
@@ -166,6 +167,14 @@ initializeSchema connection =
             (\_ ->
                 Db.execute connection
                     { statement = "ALTER TABLE records ADD COLUMN seven_inch INTEGER NOT NULL DEFAULT 0"
+                    , parameters = []
+                    }
+                    |> Task.onError (\_ -> Task.succeed 0)
+            )
+        |> Task.andThen
+            (\_ ->
+                Db.execute connection
+                    { statement = "ALTER TABLE records ADD COLUMN year_released INTEGER"
                     , parameters = []
                     }
                     |> Task.onError (\_ -> Task.succeed 0)
@@ -629,6 +638,10 @@ handleCreateRecordWithTime model response formData nowMs =
             Dict.get "month" formData
                 |> Maybe.andThen String.toInt
 
+        yearReleased =
+            Dict.get "year_released" formData
+                |> Maybe.andThen String.toInt
+
         notes =
             Dict.get "notes" formData
                 |> Maybe.andThen
@@ -651,6 +664,7 @@ handleCreateRecordWithTime model response formData nowMs =
                     , title = title
                     , year = year
                     , month = month
+                    , yearReleased = yearReleased
                     , notes = notes
                     , is7Inch = is7Inch
                     , createdAt = nowMs
@@ -687,6 +701,10 @@ handleUpdateRecord model idStr request response =
             Dict.get "month" formData
                 |> Maybe.andThen String.toInt
 
+        yearReleased =
+            Dict.get "year_released" formData
+                |> Maybe.andThen String.toInt
+
         notes =
             Dict.get "notes" formData
                 |> Maybe.andThen
@@ -710,6 +728,7 @@ handleUpdateRecord model idStr request response =
                     , title = title
                     , year = year
                     , month = month
+                    , yearReleased = yearReleased
                     , notes = notes
                     , is7Inch = is7Inch
                     }
@@ -1287,6 +1306,7 @@ recordsListPage prefillArtist records =
                             , H.th [] [ H.text "Title" ]
                             , H.th [] [ H.text "Year" ]
                             , H.th [] [ H.text "Month" ]
+                            , H.th [] [ H.text "Released" ]
                             , H.th [] [ H.text "Plays" ]
                             , H.th [] [ H.text "Actions" ]
                             ]
@@ -1318,6 +1338,14 @@ recordRow record =
 
                 Just month ->
                     String.fromInt month
+
+        yearReleasedStr =
+            when record.yearReleased is
+                Nothing ->
+                    "-"
+
+                Just yearReleased ->
+                    String.fromInt yearReleased
     in
     H.tr []
         [ H.td [] [ H.text record.artist ]
@@ -1329,6 +1357,7 @@ recordRow record =
             )
         , H.td [] [ H.text yearStr ]
         , H.td [] [ H.text monthStr ]
+        , H.td [] [ H.text yearReleasedStr ]
         , H.td [] [ H.text (String.fromInt record.playCount) ]
         , H.td [ A.class "actions" ]
             [ H.a [ A.href ("/records/" ++ idStr ++ "/edit") ] [ H.text "Edit" ]
@@ -1379,6 +1408,12 @@ recordForm { existing, prefillArtist } =
         monthValue =
             maybeRecord
                 |> Maybe.andThen .month
+                |> Maybe.map String.fromInt
+                |> Maybe.withDefault ""
+
+        yearReleasedValue =
+            maybeRecord
+                |> Maybe.andThen .yearReleased
                 |> Maybe.map String.fromInt
                 |> Maybe.withDefault ""
 
@@ -1444,6 +1479,18 @@ recordForm { existing, prefillArtist } =
                 , A.value monthValue
                 , A.attribute "min" "1"
                 , A.attribute "max" "12"
+                ]
+                []
+            ]
+        , H.div []
+            [ H.label [ A.for "year_released" ] [ H.text "Year Released (optional)" ]
+            , H.input
+                [ A.type_ "number"
+                , A.name "year_released"
+                , A.id "year_released"
+                , A.value yearReleasedValue
+                , A.attribute "min" "1900"
+                , A.attribute "max" "2100"
                 ]
                 []
             ]
